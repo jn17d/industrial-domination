@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Industrial Domination — Claim the City</title>
+  </head>
+  <body>
+    <!-- Full-screen MapLibre GL canvas -->
+    <div id="map"></div>
+
+    <!--
+      All HTML UI lives above the map inside one overlay. The overlay itself is
+      pointer-events:none so map panning still works; individual panels opt back
+      in via CSS.
+    -->
+    <div id="ui-overlay">
+      <div class="stack stack--left">
+        <form id="search-panel" class="panel" role="search" autocomplete="off">
+          <label class="panel__title" for="search-input">Find a location</label>
+          <div class="search-row">
+            <input
+              id="search-input"
+              name="q"
+              type="search"
+              placeholder="City, street or postcode…"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button id="search-submit" type="submit">Search</button>
+          </div>
+          <p id="search-status" class="status" role="status" aria-live="polite"></p>
+          <ul id="search-results" class="results" hidden></ul>
+          <p class="attribution">Search by OpenStreetMap Nominatim</p>
+        </form>
+
+        <div class="panel panel--hud">
+          <div class="hud">
+            <span class="hud__label">Cash</span>
+            <strong id="hud-cash" class="hud__value">—</strong>
+          </div>
+          <div class="hud">
+            <span class="hud__label">Claimed</span>
+            <strong id="hud-claimed" class="hud__value">0</strong>
+          </div>
+          <button id="hud-reset" type="button" class="link-btn">reset</button>
+        </div>
+
+        <div class="panel panel--log">
+          <div class="panel__header">
+            <span class="panel__title">Building log</span>
+            <button id="log-clear" type="button" class="link-btn">clear</button>
+          </div>
+          <ul id="log-list" class="log"></ul>
+        </div>
+      </div>
+
+      <!-- Bottom-docked stats card for the currently selected building -->
+      <section id="stats-card" class="card" aria-live="polite" hidden>
+        <div class="card__grid">
+          <div class="field">
+            <span class="field__label">Name</span>
+            <span id="stat-name" class="field__value">—</span>
+          </div>
+          <div class="field">
+            <span class="field__label">OSM ID</span>
+            <span id="stat-osm-id" class="field__value">—</span>
+          </div>
+          <div class="field">
+            <span class="field__label">Type</span>
+            <span id="stat-type" class="field__value">—</span>
+          </div>
+          <div class="field">
+            <span class="field__label">Height</span>
+            <span id="stat-height" class="field__value">—</span>
+          </div>
+          <div class="field">
+            <span class="field__label">Footprint</span>
+            <span id="stat-area" class="field__value">—</span>
+          </div>
+        </div>
+        <button id="claim-button" type="button" class="claim-btn">Claim Building ($1,000)</button>
+      </section>
+
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+      <div id="zoom-hint" class="zoom-hint" hidden>Zoom in to reveal 3D buildings</div>
+      <div id="fatal" class="fatal" hidden></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

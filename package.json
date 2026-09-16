@@ -1,0 +1,26 @@
+{
+  "name": "industrial-domination",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "OSM vector-map web game prototype: search a place, inspect real 3D building footprints, and claim them.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@turf/area": "^7.4.0",
+    "@turf/boolean-point-in-polygon": "^7.4.0",
+    "@turf/buffer": "^7.4.0",
+    "@turf/centroid": "^7.4.0",
+    "@turf/helpers": "^7.4.0",
+    "maplibre-gl": "^6.10.0"
+  },
+  "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}
