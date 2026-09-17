@@ -2,6 +2,8 @@ import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
 import area from '@turf/area';
 import buffer from '@turf/buffer';
 import centroid from '@turf/centroid';
+import intersect from '@turf/intersect';
+import union from '@turf/union';
 import type {
   Feature,
   FeatureCollection,
@@ -63,11 +65,22 @@ export interface ClaimedFeatureInput {
 
 export const CLAIMED_SOURCE_ID = 'claimed-buildings';
 const CLAIMED_FILL_LAYER_ID = 'claimed-buildings-fill';
+/**
+ * Exported: the three.js procedural model replaces the flat fill too, so
+ * `main.ts` hides it by id (the neon ground square reads as a blank claim when
+ * the model is what matters).
+ */
+export { CLAIMED_FILL_LAYER_ID };
 const CLAIMED_OUTLINE_LAYER_ID = 'claimed-buildings-outline';
-const CLAIMED_EXTRUSION_LAYER_ID = 'claimed-buildings-3d';
+/**
+ * Exported: the three.js procedural-models layer replaces this extrusion, so
+ * `main.ts` hides it (and can restore it as a fallback) by id.
+ */
+export const CLAIMED_EXTRUSION_LAYER_ID = 'claimed-buildings-3d';
 
 const HOVER_SOURCE_ID = 'building-hover';
 const HOVER_LAYER_ID = 'building-hover-outline';
+const HOVER_GLOW_LAYER_ID = 'building-hover-glow';
 
 /** Neon green, per spec. */
 export const CLAIMED_COLOR = '#00ff88';
@@ -86,6 +99,15 @@ const DEFAULT_BUILDING_HEIGHT = 8;
 const MIN_CLAIMABLE_AREA_M2 = 5;
 
 /**
+ * When several parts contain the cursor, prefer the smallest that reaches this
+ * size. The tile is littered with ~5 m2 clip fragments, and a plain smallest-part
+ * rule resolves to one of those on every click instead of the building the player
+ * is pointing at. Falls back to the smallest containing part when nothing reaches
+ * this size, so genuinely tiny buildings stay claimable.
+ */
+const PREFERRED_MIN_CLAIM_AREA_M2 = 20;
+
+/**
  * The claimed extrusion must fully enclose the basemap building rather than share
  * faces with it.
  *
@@ -100,9 +122,9 @@ const MIN_CLAIMABLE_AREA_M2 = 5;
  *  - roof raised above the basemap roof
  *  - base extended below the basemap base, clamped to ground level
  */
-const CLAIMED_WALL_INFLATION_M = 0.6;
-const CLAIMED_HEIGHT_EPSILON = 1.2;
-const CLAIMED_BASE_EPSILON = 0.4;
+const CLAIMED_WALL_INFLATION_M = 0.25;
+const CLAIMED_HEIGHT_EPSILON = 0.35;
+const CLAIMED_BASE_EPSILON = 0.2;
 
 /** Flat `building` fills are drawn from z13; `building-3d` extrusions from z14. */
 export const BUILDING_MIN_ZOOM = 13;
@@ -193,7 +215,7 @@ function hashGeometry(geometry: Geometry | null | undefined): string {
  * footprint seen from the neighbouring tile, so such a building could be claimed
  * twice from opposite sides of a boundary.
  */
-function partClaimId(part: Polygon): string {
+function partClaimId(part: Polygon | MultiPolygon): string {
   return `part-${hashGeometry(part)}`;
 }
 
@@ -236,16 +258,25 @@ function splitIntoPolygons(geometry: Polygon | MultiPolygon): Polygon[] {
 }
 
 /**
- * Push a footprint outward so the claimed extrusion's walls cannot be coplanar
+ * Push a footprint outward so an overlay's walls/outline cannot be coplanar
  * with the basemap building's.
+ *
+ * The claimed extrusion needs this so its walls do not z-fight the basemap's
+ * (identical footprint, identical render_min_height, coincident depth values
+ * flickering into patches that read as the green shape clipping through the
+ * building); the hover outline needs it so the line draws outside the building
+ * silhouette instead of being half-buried by the extrusion wall at pitch.
  *
  * This runs on the render path only: stored claims keep their true footprint, so
  * claim identity and the reported area are unaffected by the inflation. Buffering
  * can fail on malformed geometry, so the original footprint is the fallback.
  */
-function inflateFootprint(geometry: Polygon | MultiPolygon): Polygon | MultiPolygon {
+function inflateFootprint(
+  geometry: Polygon | MultiPolygon,
+  meters: number = CLAIMED_WALL_INFLATION_M,
+): Polygon | MultiPolygon {
   try {
-    const buffered = buffer(asFeature(geometry), CLAIMED_WALL_INFLATION_M, {
+    const buffered = buffer(asFeature(geometry), meters, {
       units: 'meters',
     });
     const out = buffered?.geometry;
@@ -297,29 +328,141 @@ function squaredDistance(a: [number, number], b: [number, number]): number {
 }
 
 /**
- * Reduce a footprint to the single part the cursor is actually over.
+ * A group of footprint rings that belong to the same physical building.
  *
- * OpenMapTiles merges large OSM `type=multipolygon` building relations into one
- * feature. In a central-London z14 tile, 285 of 510 building features are
- * multi-part and a single relation carries 994 polygons covering 365,237 m2 —
- * so claiming a feature wholesale paints a whole neighbourhood, and one small
- * building there resolves to *only* that giant relation.
- *
- * Containment is tested against the ground point under the cursor. Because a
- * pitched camera means a click on a tall building's roof unprojects slightly
- * behind its footprint, a part that fails containment falls back to the nearest
- * one by centre distance rather than producing no selection at all.
+ * `dissolved` is the union of the members (null when the union failed on
+ * malformed geometry), so a selection renders and claims as one shape.
  */
-function selectPartUnderCursor(
-  geometry: Polygon | MultiPolygon,
-  cursor: [number, number],
-): Polygon {
-  const parts = splitIntoPolygons(geometry);
-  if (parts.length === 1) return parts[0];
+interface PartCluster {
+  members: Polygon[];
+  dissolved: Polygon | MultiPolygon | null;
+}
 
-  // Bounding-box prefilter: a merged relation can hold ~1000 parts, and this
-  // runs per animation frame while hovering. The area is taken once here rather
-  // than recomputed during ranking.
+/**
+ * Above this ring count a multi-part feature is treated as a merged relation of
+ * many separate buildings rather than one large building: clustering is skipped
+ * and the smallest-ring rule applies. Pairwise adjacency on the pathological
+ * ~1000-ring relation would cost ~500k comparisons per frame for no gain — its
+ * members are streets apart, so every cluster would be a singleton anyway.
+ */
+const MAX_CLUSTERABLE_PARTS = 60;
+
+/**
+ * Bounding-box padding (degrees, ≈2 m) used to decide that two rings touch and
+ * therefore belong to one building. Rings of a single large building share
+ * walls, so their boxes abut; members of a merged neighbourhood relation are
+ * separated by streets and yards far wider than this.
+ */
+const CLUSTER_BBOX_PAD_DEG = 0.00002;
+
+/**
+ * Clusters do not depend on the cursor, and this code runs every animation
+ * frame while hovering, so results are cached per feature. The signature (total
+ * outer-ring vertex count) catches the same feature id arriving from a
+ * differently clipped neighbouring tile. Bounded, and simply emptied when full —
+ * recomputation is cheap and correctness matters more than retention here.
+ */
+const CLUSTER_CACHE_MAX = 200;
+const clusterCache = new Map<string, { signature: number; clusters: PartCluster[] }>();
+
+type RingBox = { minX: number; minY: number; maxX: number; maxY: number };
+
+function ringBox(ring: Position[]): RingBox {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const position of ring) {
+    if (position[0] < minX) minX = position[0];
+    if (position[0] > maxX) maxX = position[0];
+    if (position[1] < minY) minY = position[1];
+    if (position[1] > maxY) maxY = position[1];
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function boxesOverlap(a: RingBox, b: RingBox): boolean {
+  return (
+    a.minX - CLUSTER_BBOX_PAD_DEG <= b.maxX + CLUSTER_BBOX_PAD_DEG &&
+    a.maxX + CLUSTER_BBOX_PAD_DEG >= b.minX - CLUSTER_BBOX_PAD_DEG &&
+    a.minY - CLUSTER_BBOX_PAD_DEG <= b.maxY + CLUSTER_BBOX_PAD_DEG &&
+    a.maxY + CLUSTER_BBOX_PAD_DEG >= b.minY - CLUSTER_BBOX_PAD_DEG
+  );
+}
+
+/** Fuse a cluster's rings into one footprint; null when the union is unusable. */
+function dissolveCluster(members: Polygon[]): Polygon | MultiPolygon | null {
+  if (members.length === 1) return members[0];
+  try {
+    const merged = union({
+      type: 'FeatureCollection',
+      features: members.map(asFeature),
+    });
+    const out = merged?.geometry;
+    if (!out || (out.type !== 'Polygon' && out.type !== 'MultiPolygon')) return null;
+    if (area(asFeature(out)) < MIN_CLAIMABLE_AREA_M2) return null;
+    return out;
+  } catch (error) {
+    console.warn('[buildings] cluster dissolve failed, using first ring', error);
+    return null;
+  }
+}
+
+function buildClusters(parts: Polygon[]): PartCluster[] {
+  const boxes = parts.map((part) => ringBox(part.coordinates[0]));
+
+  // Union-find over ring adjacency.
+  const parent = parts.map((_, index) => index);
+  function find(index: number): number {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+    return index;
+  }
+  for (let i = 0; i < parts.length; i += 1) {
+    for (let j = i + 1; j < parts.length; j += 1) {
+      if (!boxesOverlap(boxes[i], boxes[j])) continue;
+      const rootI = find(i);
+      const rootJ = find(j);
+      if (rootI !== rootJ) parent[rootJ] = rootI;
+    }
+  }
+
+  const groups = new Map<number, Polygon[]>();
+  parts.forEach((part, index) => {
+    const root = find(index);
+    const group = groups.get(root);
+    if (group) group.push(part);
+    else groups.set(root, [part]);
+  });
+
+  return [...groups.values()].map((members) => ({
+    members,
+    dissolved: dissolveCluster(members),
+  }));
+}
+
+/** Cached cluster lookup; null means the feature is too multipart to cluster. */
+function clustersFor(cacheKey: string, parts: Polygon[]): PartCluster[] | null {
+  if (parts.length > MAX_CLUSTERABLE_PARTS) return null;
+
+  const signature = parts.reduce((count, part) => count + part.coordinates[0].length, 0);
+  const cached = clusterCache.get(cacheKey);
+  if (cached && cached.signature === signature) return cached.clusters;
+
+  const clusters = buildClusters(parts);
+  if (clusterCache.size >= CLUSTER_CACHE_MAX) clusterCache.clear();
+  clusterCache.set(cacheKey, { signature, clusters });
+  return clusters;
+}
+
+/**
+ * Old multi-part rule, kept for the >MAX_CLUSTERABLE_PARTS merged-relation case:
+ * smallest ring containing the cursor (two-tiered against clip fragments),
+ * falling back to the nearest ring by centre distance.
+ */
+function pickSmallestPart(parts: Polygon[], cursor: [number, number]): Polygon {
   const containing: { part: Polygon; areaM2: number }[] = [];
   for (const part of parts) {
     if (!bboxContains(part.coordinates[0], cursor)) continue;
@@ -327,14 +470,18 @@ function selectPartUnderCursor(
     containing.push({ part, areaM2: area(asFeature(part)) });
   }
 
-  // Degenerate rings exist in OSM data; without this a claim could render as an
-  // invisible sliver even though something contains the cursor.
-  const usable = containing.filter((entry) => entry.areaM2 >= MIN_CLAIMABLE_AREA_M2);
-  if (usable.length > 0) {
-    return usable.reduce((best, entry) => (entry.areaM2 < best.areaM2 ? entry : best)).part;
-  }
+  if (containing.length > 0) {
+    // Degenerate rings exist in OSM data; without this a claim could render as an
+    // invisible sliver even though something contains the cursor.
+    const usable = containing.filter((entry) => entry.areaM2 >= MIN_CLAIMABLE_AREA_M2);
+    if (usable.length === 0) return containing[0].part;
 
-  if (containing.length > 0) return containing[0].part;
+    const preferred = usable.filter(
+      (entry) => entry.areaM2 >= PREFERRED_MIN_CLAIM_AREA_M2,
+    );
+    const pool = preferred.length > 0 ? preferred : usable;
+    return pool.reduce((best, entry) => (entry.areaM2 < best.areaM2 ? entry : best)).part;
+  }
 
   let best = parts[0];
   let bestDistance = Number.POSITIVE_INFINITY;
@@ -350,21 +497,286 @@ function selectPartUnderCursor(
 }
 
 /**
+ * Reduce a footprint to the building the cursor is actually over.
+ *
+ * OpenMapTiles merges large OSM `type=multipolygon` building relations into one
+ * feature. In a central-London z14 tile, 285 of 510 building features are
+ * multi-part and a single relation carries 994 polygons covering 365,237 m2 —
+ * so claiming a feature wholesale paints a whole neighbourhood, and one small
+ * building there resolves to *only* that giant relation.
+ *
+ * But a single large building is ALSO often multi-part (wings mapped as one
+ * multipolygon relation), and treating each ring as its own claimable building
+ * splits those big buildings into many small polygons. Rings of one building
+ * share walls, while relation members sit streets apart — so rings are grouped
+ * into touching clusters (see buildClusters) and the *dissolved cluster* under
+ * the cursor is returned: one highlight, one claim, correct total area. Features
+ * with too many rings to plausibly be one building fall back to pickSmallestPart.
+ *
+ * Containment is tested against the ground point under the cursor. Because a
+ * pitched camera means a click on a tall building's roof unprojects slightly
+ * behind its footprint, a cluster that fails containment falls back to the
+ * nearest one by centre distance rather than producing no selection at all.
+ */
+function selectPartUnderCursor(
+  geometry: Polygon | MultiPolygon,
+  cursor: [number, number],
+  cacheKey: string,
+): Polygon | MultiPolygon {
+  const parts = splitIntoPolygons(geometry);
+  if (parts.length === 1) return parts[0];
+
+  const clusters = clustersFor(cacheKey, parts);
+  if (!clusters) return pickSmallestPart(parts, cursor);
+
+  let containing: PartCluster | null = null;
+  for (const cluster of clusters) {
+    for (const member of cluster.members) {
+      if (!bboxContains(member.coordinates[0], cursor)) continue;
+      if (!booleanPointInPolygon(cursor, member)) continue;
+      containing = cluster;
+      break;
+    }
+    if (containing) break;
+  }
+
+  if (!containing) {
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const cluster of clusters) {
+      for (const member of cluster.members) {
+        const distance = squaredDistance(cursor, ringCenter(member.coordinates[0]));
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          containing = cluster;
+        }
+      }
+    }
+  }
+
+  if (!containing) return parts[0];
+  return containing.dissolved ?? containing.members[0];
+}
+
+/**
+ * Grow a mid/high-rise selection into its physically-attached neighbours.
+ *
+ * Ring clustering merges rings *within one tile feature*, but the remaining
+ * splits come from buildings mappers drew as several *separate* OSM ways:
+ * tower phases sharing a wall, towers on a common podium, wings of one
+ * development. `queryRenderedFeatures` only returns features covering the
+ * cursor, so those neighbours never even reach `pickBuildingAt` — hence the
+ * caller passes a bbox query callback and this function grows outward from the
+ * picked footprint until nothing more merges.
+ *
+ * Balanced merge tests (so terrace rows and touching-but-separate towers stay
+ * separate): both footprints mid/high-rise; heights within a similar band or
+ * one tier starting where the other ends (podium); and a genuine shared wall
+ * (dilating the selection by 1 m must overlap the neighbour by >= 3 m2 — a
+ * corner touch yields ~0, a party wall yields metres).
+ *
+ * Low-rise and hide_3d-outline picks bypass growth entirely, so dense
+ * low-rise areas behave exactly as before.
+ */
+const MID_RISE_MIN_HEIGHT_M = 12;
+const GROWTH_DILATION_M = 1;
+const MIN_SHARED_WALL_M2 = 3;
+const HEIGHT_BAND_RATIO = 0.4;
+const PODIUM_TOLERANCE_M = 5;
+const MAX_GROWTH_ROUNDS = 5;
+const GROWTH_CACHE_MAX = 200;
+const growthCache = new Map<string, BuildingInfo>();
+
+type GeomBox = [number, number, number, number];
+
+function geomBBox(geometry: Polygon | MultiPolygon): GeomBox {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const polygon of splitIntoPolygons(geometry)) {
+    for (const ring of polygon.coordinates) {
+      for (const position of ring) {
+        if (position[0] < minX) minX = position[0];
+        if (position[0] > maxX) maxX = position[0];
+        if (position[1] < minY) minY = position[1];
+        if (position[1] > maxY) maxY = position[1];
+      }
+    }
+  }
+  return [minX, minY, maxX, maxY];
+}
+
+function boxCenter(box: GeomBox): [number, number] {
+  return [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2];
+}
+
+/** Height test: similar band, or one tier starts where the other ends. */
+function heightsMergeable(hA: number, mhA: number, hB: number, mhB: number): boolean {
+  const similarBand =
+    Math.abs(hA - hB) <= HEIGHT_BAND_RATIO * Math.max(hA, hB);
+  if (similarBand) return true;
+  // Podium: the taller footprint's base sits at (roughly) the shorter one's top.
+  return hB >= hA
+    ? Math.abs(mhB - hA) <= PODIUM_TOLERANCE_M
+    : Math.abs(mhA - hB) <= PODIUM_TOLERANCE_M;
+}
+
+export function growSelection(
+  primary: BuildingInfo,
+  queryNeighbours: (bbox: GeomBox) => MapGeoJSONFeature[],
+): BuildingInfo {
+  if (primary.hide3d) return primary;
+  if (primary.height < MID_RISE_MIN_HEIGHT_M) return primary;
+
+  const cached = growthCache.get(primary.osmId);
+  if (cached) return cached;
+
+  const mergedIds = new Set<string>([primary.osmFeatureId ?? primary.osmId]);
+  let current = primary.geometry;
+  let maxHeight = primary.height;
+  let minHeight = primary.minHeight;
+  let mergedAny = false;
+
+  for (let round = 0; round < MAX_GROWTH_ROUNDS; round += 1) {
+    let dilated: Feature<Polygon | MultiPolygon> | null = null;
+    try {
+      const result = buffer(asFeature(current), GROWTH_DILATION_M, { units: 'meters' });
+      if (
+        result?.geometry &&
+        (result.geometry.type === 'Polygon' || result.geometry.type === 'MultiPolygon')
+      ) {
+        dilated = result as Feature<Polygon | MultiPolygon>;
+      }
+    } catch {
+      break;
+    }
+    if (!dilated) break;
+
+    const toMerge: (Polygon | MultiPolygon)[] = [];
+    for (const feature of queryNeighbours(geomBBox(dilated.geometry))) {
+      const geometry = feature.geometry;
+      if (!geometry || (geometry.type !== 'Polygon' && geometry.type !== 'MultiPolygon')) continue;
+      // Outlines are already whole buildings; growth only fuses real extrusions.
+      if (isTruthy(feature.properties?.hide_3d)) continue;
+
+      const id = getFeatureId(feature);
+      if (mergedIds.has(id)) continue;
+      mergedIds.add(id);
+
+      const part = selectPartUnderCursor(geometry, boxCenter(geomBBox(geometry)), id);
+      if (area(asFeature(part)) < MIN_CLAIMABLE_AREA_M2) continue;
+
+      const properties = feature.properties ?? {};
+      const height = toFiniteNumber(properties.render_height, DEFAULT_BUILDING_HEIGHT);
+      const baseHeight = toFiniteNumber(properties.render_min_height, 0);
+      if (height < MID_RISE_MIN_HEIGHT_M) continue;
+      if (!heightsMergeable(maxHeight, minHeight, height, baseHeight)) continue;
+
+      let overlapArea = 0;
+      try {
+        const overlap = intersect({
+          type: 'FeatureCollection',
+          features: [asFeature(part), dilated],
+        });
+        if (overlap?.geometry) overlapArea = area(overlap);
+      } catch {
+        overlapArea = 0;
+      }
+      if (overlapArea < MIN_SHARED_WALL_M2) continue;
+
+      toMerge.push(part);
+      maxHeight = Math.max(maxHeight, height);
+      minHeight = Math.min(minHeight, baseHeight);
+    }
+
+    if (toMerge.length === 0) break;
+
+    try {
+      const merged = union({
+        type: 'FeatureCollection',
+        features: [asFeature(current), ...toMerge.map(asFeature)],
+      });
+      if (!merged?.geometry) break;
+      current = merged.geometry;
+      mergedAny = true;
+    } catch (error) {
+      console.warn('[buildings] selection growth union failed', error);
+      break;
+    }
+  }
+
+  const result: BuildingInfo = mergedAny
+    ? {
+        ...primary,
+        geometry: current,
+        height: maxHeight,
+        minHeight,
+        type: classifyBuilding(maxHeight, false),
+        areaM2: area(asFeature(current)),
+        centroid: centroid(asFeature(current)).geometry.coordinates as [number, number],
+        osmId: partClaimId(current),
+      }
+    : primary;
+
+  if (growthCache.size >= GROWTH_CACHE_MAX) growthCache.clear();
+  growthCache.set(primary.osmId, result);
+  return result;
+}
+
+/**
+ * True when any polygon of `part` has its centroid inside `outline`, i.e. the
+ * part belongs to the building that outline encloses. Centroid testing is
+ * deliberately cheap: this only aggregates part heights for a selection, and a
+ * part straddling two buildings is rare enough that either parent's height is a
+ * fine answer.
+ */
+function partLiesWithin(
+  part: Polygon | MultiPolygon,
+  outline: Polygon | MultiPolygon,
+): boolean {
+  return splitIntoPolygons(part).some((polygon) =>
+    booleanPointInPolygon(centroid(asFeature(polygon)), outline),
+  );
+}
+
+/**
  * Choose the building under the cursor from raw query results.
  *
  * Candidates overlap often (a merged relation plus standalone footprints beneath
- * it), so render order is not trustworthy here: the smallest resolved part wins.
- * MapLibre orders results by render order, which for fill-extrusions accounts for
- * 3D depth, so the first candidate still wins ties. The same footprint can appear
- * twice, once per resolved layer, hence the id dedupe.
+ * it), so a plain smallest-area race is wrong twice over: it can hand the claim to
+ * a ~5 m2 clip fragment even when a real building also contains the cursor, and it
+ * never rewards the building the player actually pointed at.
+ *
+ * So candidates are ranked in two tiers, both smallest-first: anything at or above
+ * PREFERRED_MIN_CLAIM_AREA_M2 wins over anything below it, and within a tier the
+ * smallest (most specific) footprint wins. MapLibre only returns features whose
+ * rendered geometry covers the cursor, so every candidate is genuinely under the
+ * pointer; the tiers just decide which of those is the building, not the fragment.
+ *
+ * The one override: a `hide_3d` candidate is the OSM *outline* of a building that
+ * mappers decomposed into `building:part` polygons (a tower rendered as many small
+ * extrusions inside it). The Liberty style does not filter those out, so they reach
+ * this query — and selecting one of the tiny parts instead of the outline is what
+ * makes a high-rise claim as a sliver. An outline therefore wins outright over any
+ * part-sized candidate, with its height/min-height summarised from the parts inside
+ * it so pricing, classification and the claimed extrusion describe the whole tower.
+ * Smallest outline wins when several nest, guarding against a giant merged
+ * relation that also carries hide_3d.
+ *
+ * The same footprint can appear twice, once per resolved layer, hence the id dedupe.
  */
 export function pickBuildingAt(
   features: MapGeoJSONFeature[],
   cursor: [number, number],
 ): BuildingInfo | null {
   const seen = new Set<string>();
-  let best: BuildingInfo | null = null;
-  let bestArea = Number.POSITIVE_INFINITY;
+  let preferred: BuildingInfo | null = null;
+  let preferredArea = Number.POSITIVE_INFINITY;
+  let fallback: BuildingInfo | null = null;
+  let fallbackArea = Number.POSITIVE_INFINITY;
+  let outline: BuildingInfo | null = null;
+  let outlineArea = Number.POSITIVE_INFINITY;
+  const parts: { geometry: Polygon | MultiPolygon; height: number; minHeight: number }[] = [];
 
   for (const feature of features) {
     const geometry = feature.geometry;
@@ -375,18 +787,46 @@ export function pickBuildingAt(
     if (seen.has(id)) continue;
     seen.add(id);
 
-    const part = selectPartUnderCursor(geometry, cursor);
+    const part = selectPartUnderCursor(geometry, cursor, id);
     const partArea = area(asFeature(part));
     // A claim that cannot be seen is worse than no claim: skip degenerate
     // geometry rather than painting an invisible sliver.
     if (partArea < MIN_CLAIMABLE_AREA_M2) continue;
-    if (partArea >= bestArea && best !== null) continue;
 
-    bestArea = partArea;
-    best = toBuildingInfo(feature, part, partClaimId(part));
+    const info = toBuildingInfo(feature, part, partClaimId(part));
+
+    if (info.hide3d) {
+      if (partArea < outlineArea) {
+        outlineArea = partArea;
+        outline = info;
+      }
+      continue;
+    }
+
+    parts.push({ geometry: part, height: info.height, minHeight: info.minHeight });
+
+    if (partArea >= PREFERRED_MIN_CLAIM_AREA_M2) {
+      if (partArea < preferredArea) {
+        preferredArea = partArea;
+        preferred = info;
+      }
+    } else if (partArea < fallbackArea) {
+      fallbackArea = partArea;
+      fallback = info;
+    }
   }
 
-  return best;
+  if (outline) {
+    const inside = parts.filter((entry) => partLiesWithin(entry.geometry, outline.geometry));
+    if (inside.length > 0) {
+      outline.height = Math.max(...inside.map((entry) => entry.height));
+      outline.minHeight = Math.min(...inside.map((entry) => entry.minHeight));
+      outline.type = classifyBuilding(outline.height, false);
+    }
+    return outline;
+  }
+
+  return preferred ?? fallback;
 }
 
 /**
@@ -438,6 +878,119 @@ export function toBuildingInfo(
     hide3d,
     layerId: feature.layer?.id ?? 'unknown',
   };
+}
+
+/**
+ * Ambient-model tuning: how many unclaimed buildings the three.js layer renders
+ * per viewport, the smallest footprint worth a model, and the zoom below which
+ * the scene is emptied (ambient models exist only where extrusions would).
+ */
+export const AMBIENT_MAX_MODELS = 600;
+export const AMBIENT_MIN_AREA_M2 = 20;
+
+/**
+ * Collect every unclaimed-worthy building currently rendered in the viewport,
+ * for the ambient three.js warehouse layer.
+ *
+ * Uses `queryRenderedFeatures` over the whole viewport (the basemap building
+ * layers stay queryable because they are hidden via paint opacity, not
+ * `visibility: none` — the query filters on visibility, not paint). Dedupes
+ * across resolved layers and across tile-clip duplicates of one feature,
+ * skips `hide_3d` outlines and sliver fragments, and keeps the
+ * `AMBIENT_MAX_MODELS` buildings nearest the viewport centre.
+ */
+export function collectViewportBuildings(map: MapLibreMap): BuildingInfo[] {
+  const layers = resolveBuildingLayers(map);
+  if (layers.length === 0) return [];
+
+  let features: MapGeoJSONFeature[];
+  try {
+    features = map.queryRenderedFeatures({ layers });
+  } catch (error) {
+    console.warn('[buildings] viewport query failed', error);
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const center = map.getCenter();
+  const cursor: [number, number] = [center.lng, center.lat];
+  const ranked: { info: BuildingInfo; dist2: number }[] = [];
+
+  for (const feature of features) {
+    const geometry = feature.geometry;
+    if (!geometry || (geometry.type !== 'Polygon' && geometry.type !== 'MultiPolygon')) continue;
+    if (isTruthy(feature.properties?.hide_3d)) continue;
+
+    // Feature id (the OSM way id in OpenMapTiles) is stable across tile clips;
+    // the geometry hash covers providers without ids.
+    const dedupeKey =
+      feature.id !== undefined && feature.id !== null
+        ? `f-${feature.id}`
+        : `g-${hashGeometry(geometry)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const info = toBuildingInfo(feature, geometry, partClaimId(geometry));
+    if (info.areaM2 < AMBIENT_MIN_AREA_M2) continue;
+
+    ranked.push({ info, dist2: squaredDistance(cursor, info.centroid) });
+  }
+
+  ranked.sort((a, b) => a.dist2 - b.dist2);
+  return ranked.slice(0, AMBIENT_MAX_MODELS).map((entry) => entry.info);
+}
+
+/**
+ * Blank the basemap's own building fills/extrusions (paint opacity 0, NOT
+ * `visibility: none`) so the procedural three.js models replace them while
+ * hover/click picking via `queryRenderedFeatures` keeps working.
+ *
+ * Paint properties reset when the style reloads, so call this on every
+ * `style.load` as well as once after the initial load.
+ */
+export function hideBasemapBuildingShapes(map: MapLibreMap): void {
+  for (const layerId of resolveBuildingLayers(map)) {
+    const layer = map.getLayer(layerId);
+    if (!layer) continue;
+    try {
+      if (layer.type === 'fill-extrusion') {
+        map.setPaintProperty(layerId, 'fill-extrusion-opacity', 0);
+      } else if (layer.type === 'fill') {
+        map.setPaintProperty(layerId, 'fill-opacity', 0);
+      }
+    } catch (error) {
+      console.warn(`[buildings] failed to blank building layer ${layerId}`, error);
+    }
+  }
+}
+
+/**
+ * True when a viewport building is already covered by a claim — either the
+ * claim keys match exactly, or the footprints overlap via centroid containment
+ * (the click path may resolve a merged relation to a sub-part, giving the claim
+ * a different key than the ambient whole-feature model).
+ */
+export function isCoveredByClaim(
+  building: BuildingInfo,
+  claims: { osmId: string; centroid: [number, number]; geometry: Polygon | MultiPolygon }[],
+): boolean {
+  for (const claim of claims) {
+    if (claim.osmId === building.osmId) return true;
+    try {
+      if (booleanPointInPolygon({ type: 'Point', coordinates: building.centroid }, claim.geometry)) {
+        return true;
+      }
+      if (
+        booleanPointInPolygon({ type: 'Point', coordinates: claim.centroid }, building.geometry)
+      ) {
+        return true;
+      }
+    } catch {
+      // Malformed footprint: treat as not covered, the exact-key check above
+      // still catches the common case.
+    }
+  }
+  return false;
 }
 
 /** Insert point that keeps overlay geometry beneath map labels. */
@@ -529,7 +1082,34 @@ export function ensureOverlayLayers(map: MapLibreMap): void {
     );
   }
 
+  if (!map.getLayer(HOVER_GLOW_LAYER_ID)) {
+    map.addLayer(
+      {
+        id: HOVER_GLOW_LAYER_ID,
+        type: 'line',
+        source: HOVER_SOURCE_ID,
+        paint: {
+          'line-color': HOVER_COLOR,
+          'line-width': 12,
+          'line-blur': 6,
+          'line-opacity': 0.4,
+        },
+      },
+      beforeId,
+    );
+  }
+
   if (!map.getLayer(HOVER_LAYER_ID)) {
+    const width: ExpressionSpecification = [
+      'interpolate',
+      ['linear'],
+      ['zoom'],
+      14,
+      3,
+      18,
+      5,
+    ];
+
     map.addLayer(
       {
         id: HOVER_LAYER_ID,
@@ -537,8 +1117,8 @@ export function ensureOverlayLayers(map: MapLibreMap): void {
         source: HOVER_SOURCE_ID,
         paint: {
           'line-color': HOVER_COLOR,
-          'line-width': 2,
-          'line-opacity': 0.95,
+          'line-width': width,
+          'line-opacity': 1,
         },
       },
       beforeId,
@@ -576,6 +1156,9 @@ export function syncClaimedBuildings(
   source.setData({ type: 'FeatureCollection', features });
 }
 
+/** Hover outline offset, so the line clears the building wall instead of sharing its edge. */
+const HOVER_WALL_INFLATION_M = 0.6;
+
 /** Show (or clear) the hover outline for the building under the cursor. */
 export function setHoveredBuilding(map: MapLibreMap, info: BuildingInfo | null): void {
   const source = map.getSource(HOVER_SOURCE_ID) as GeoJSONSource | undefined;
@@ -591,7 +1174,10 @@ export function setHoveredBuilding(map: MapLibreMap, info: BuildingInfo | null):
     features: [
       {
         type: 'Feature',
-        geometry: info.geometry,
+        // Inflated so the crisp line and its glow draw just outside the
+        // extrusion silhouette; a line exactly on the footprint edge is half
+        // hidden by the building wall itself under a pitched camera.
+        geometry: inflateFootprint(info.geometry, HOVER_WALL_INFLATION_M),
         properties: { osmId: info.osmId },
       },
     ],

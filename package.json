@@ -16,10 +16,14 @@
     "@turf/buffer": "^7.4.0",
     "@turf/centroid": "^7.4.0",
     "@turf/helpers": "^7.4.0",
-    "maplibre-gl": "^6.10.0"
+    "@turf/intersect": "^7.4.0",
+    "@turf/union": "^7.4.0",
+    "maplibre-gl": "^6.10.0",
+    "three": "^0.186.0"
   },
   "devDependencies": {
     "@types/geojson": "^7946.0.16",
+    "@types/three": "^0.186.0",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
   }

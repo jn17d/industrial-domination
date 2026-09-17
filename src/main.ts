@@ -3,21 +3,27 @@ import './style.css';
 import {
   BUILDING_3D_MIN_ZOOM,
   BUILDING_MIN_ZOOM,
+  CLAIMED_EXTRUSION_LAYER_ID,
+  CLAIMED_FILL_LAYER_ID,
+  collectViewportBuildings,
   ensureOverlayLayers,
+  isCoveredByClaim,
   syncClaimedBuildings,
 } from './buildings.ts';
 import type { BuildingInfo } from './buildings.ts';
+import { addProceduralModelsLayer } from './map3d/claimedModelsLayer.ts';
+import type { ProceduralModelsLayer } from './map3d/claimedModelsLayer.ts';
 import { createMap, isWebGL2Available } from './map.ts';
 import type { MapController } from './map.ts';
 import { searchPlaces } from './search.ts';
 import type { GeocodeResult } from './search.ts';
 import {
-  CLAIM_COST,
   canAfford,
   claimBuilding,
   getClaimCount,
   getState,
   isClaimed,
+  priceForBuilding,
   resetGame,
   subscribe,
 } from './state.ts';
@@ -33,6 +39,12 @@ function requireElement<T extends HTMLElement>(selector: string): T {
 }
 
 let controller: MapController | null = null;
+
+/** Procedural three.js models (ambient warehouses + claimed buildings). */
+let modelsLayer: ProceduralModelsLayer | null = null;
+
+/** Latest viewport scan, kept so claim changes can re-filter the ambient scene. */
+let lastAmbient: BuildingInfo[] = [];
 
 /** Currently selected building, i.e. whatever the stats card is showing. */
 let selected: BuildingInfo | null = null;
@@ -60,14 +72,41 @@ function syncHud(): void {
   const state = getState();
   if (controller) {
     syncClaimedBuildings(controller.map, Object.values(state.claims));
+    modelsLayer?.updateClaims(Object.values(state.claims));
+    // A new claim removes its ambient twin (or upgrades the footprint), so the
+    // ambient scene must re-filter against the claim set even without a move.
+    modelsLayer?.updateAmbient(
+      lastAmbient.filter((building) => !isCoveredByClaim(building, Object.values(state.claims))),
+    );
   }
   ui.renderHud(state.cash, getClaimCount());
+}
+
+/**
+ * Refresh the ambient (unclaimed) warehouse models from the current viewport.
+ * Called on `idle` — after movement settles and pending tiles finish loading —
+ * never per frame; the layer diffs placements so unchanged buildings cost
+ * nothing.
+ */
+function refreshAmbient(): void {
+  if (!controller || !modelsLayer) return;
+
+  if (controller.map.getZoom() < BUILDING_3D_MIN_ZOOM) {
+    lastAmbient = [];
+    modelsLayer.updateAmbient(lastAmbient);
+    return;
+  }
+
+  const claims = Object.values(getState().claims);
+  const raw = collectViewportBuildings(controller.map);
+  lastAmbient = raw.filter((building) => !isCoveredByClaim(building, claims));
+  modelsLayer.updateAmbient(lastAmbient);
 }
 
 function renderStats(): void {
   ui.renderStats(selected, {
     claimed: selected ? isClaimed(selected.osmId) : false,
-    affordable: canAfford(),
+    affordable: selected ? canAfford(priceForBuilding(selected)) : true,
   });
 }
 
@@ -140,7 +179,7 @@ function claimSelected(): void {
     ui.showToast(
       result.reason === 'already-claimed'
         ? 'You already own this building.'
-        : `Not enough cash — you need ${formatCurrency(CLAIM_COST)}.`,
+        : `Not enough cash — this costs ${formatCurrency(priceForBuilding(selected))}.`,
       'error',
     );
     return;
@@ -148,7 +187,7 @@ function claimSelected(): void {
 
   ui.markClaimed(result.claim.osmId);
   ui.showToast(
-    `Claimed ${result.claim.name} for ${formatCurrency(CLAIM_COST)}`,
+    `Claimed ${result.claim.name} for ${formatCurrency(result.claim.pricePaid)}`,
     'success',
   );
 }
@@ -162,6 +201,8 @@ function updateZoomHint(): void {
 function start(): void {
   const mapController = createMap(container, { onSelect: handleSelect });
   controller = mapController;
+  // Dev-only debug handle for live diagnosis in browser DevTools / automation.
+  (window as unknown as Record<string, unknown>).__map = mapController.map;
 
   // One subscription drives every state-derived view, so a claim or reset can
   // never leave the overlay, HUD and stats card disagreeing.
@@ -174,12 +215,25 @@ function start(): void {
     // Called explicitly (rather than relying on createMap's own load listener)
     // so the overlay source exists before the first sync.
     ensureOverlayLayers(mapController.map);
+    // Procedural three.js models replace the neon-green extrusion block and the
+    // flat green fill for claimed buildings. Keep the outline layer (hover +
+    // minimap-read); the extrusion and fill would render as a blank green
+    // square sitting inside/under the model.
+    modelsLayer = addProceduralModelsLayer(mapController.map);
+    // Dev-only debug handle for live diagnosis in browser DevTools / automation.
+    (window as unknown as Record<string, unknown>).__models = modelsLayer;
+    mapController.map.setLayoutProperty(CLAIMED_EXTRUSION_LAYER_ID, 'visibility', 'none');
+    mapController.map.setLayoutProperty(CLAIMED_FILL_LAYER_ID, 'visibility', 'none');
     updateZoomHint();
+    refreshAmbient();
     syncHud();
     renderStats();
   });
 
   mapController.map.on('moveend', updateZoomHint);
+  // `idle` fires once movement settles AND pending tiles have loaded — the
+  // right moment to rescan the viewport for ambient warehouse models.
+  mapController.map.on('idle', refreshAmbient);
 
   syncHud();
   renderStats();

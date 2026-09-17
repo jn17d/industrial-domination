@@ -3,10 +3,19 @@ import type { BuildingInfo } from './buildings.ts';
 
 /**
  * Economy tuning — the single place to rebalance the prototype.
- * STARTING_CASH / CLAIM_COST = how many buildings a fresh game can buy.
+ *
+ * Buildings are priced by footprint: area x PRICE_PER_SQUARE_METRE, rounded up to
+ * PRICE_ROUNDING and floored at MIN_CLAIM_PRICE. With the defaults a median
+ * ~66 m2 building costs about $700, so STARTING_CASH buys roughly fifteen of
+ * them — but a 5,000 m2 complex is $50,000 and stays out of reach early on.
  */
 export const STARTING_CASH = 10_000;
-export const CLAIM_COST = 1_000;
+/** Base land value in dollars per square metre of footprint. */
+export const PRICE_PER_SQUARE_METRE = 10;
+/** Floor price, so tiny footprints are still worth owning. */
+export const MIN_CLAIM_PRICE = 100;
+/** Prices are rounded up to this multiple to keep them readable. */
+export const PRICE_ROUNDING = 10;
 
 export interface ClaimRecord {
   /** OSM way id, also used as the claim key. */
@@ -169,17 +178,31 @@ export function getClaimCount(): number {
   return Object.keys(state.claims).length;
 }
 
-export function canAfford(cost: number = CLAIM_COST): boolean {
+export function canAfford(cost: number): boolean {
   return state.cash >= cost;
+}
+
+/**
+ * Price a building from its footprint area.
+ *
+ * Rounded up (never down) so a price is always at least area x rate, and floored
+ * so degenerate slivers are not free.
+ */
+export function priceForBuilding(info: BuildingInfo): number {
+  const raw = info.areaM2 * PRICE_PER_SQUARE_METRE;
+  const rounded = Math.ceil(raw / PRICE_ROUNDING) * PRICE_ROUNDING;
+  return Math.max(MIN_CLAIM_PRICE, rounded);
 }
 
 export function claimBuilding(info: BuildingInfo): ClaimResult {
   if (Object.hasOwn(state.claims, info.osmId)) {
     return { ok: false, reason: 'already-claimed' };
   }
+  const price = priceForBuilding(info);
+
   // Authoritative affordability check: the UI also disables the button, but a
   // stale render must never be able to spend cash the player does not have.
-  if (state.cash < CLAIM_COST) {
+  if (state.cash < price) {
     return { ok: false, reason: 'insufficient-funds' };
   }
 
@@ -194,11 +217,11 @@ export function claimBuilding(info: BuildingInfo): ClaimResult {
     geometry: info.geometry,
     hide3d: info.hide3d,
     claimedAt: new Date().toISOString(),
-    pricePaid: CLAIM_COST,
+    pricePaid: price,
   };
 
   state.claims[info.osmId] = claim;
-  state.cash -= CLAIM_COST;
+  state.cash -= price;
   persist();
   emit();
 

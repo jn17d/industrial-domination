@@ -1,6 +1,6 @@
 import type { BuildingInfo } from './buildings.ts';
 import type { GeocodeResult } from './search.ts';
-import { CLAIM_COST } from './state.ts';
+import { priceForBuilding } from './state.ts';
 
 export interface ClaimAvailability {
   claimed: boolean;
@@ -65,6 +65,7 @@ interface UiElements {
   statType: HTMLElement;
   statHeight: HTMLElement;
   statArea: HTMLElement;
+  statPrice: HTMLElement;
   claimButton: HTMLButtonElement;
   toast: HTMLElement;
   zoomHint: HTMLElement;
@@ -111,6 +112,7 @@ export function initUi(callbacks: UiCallbacks): UiController {
     statType: must<HTMLElement>('#stat-type'),
     statHeight: must<HTMLElement>('#stat-height'),
     statArea: must<HTMLElement>('#stat-area'),
+    statPrice: must<HTMLElement>('#stat-price'),
     claimButton: must<HTMLButtonElement>('#claim-button'),
     toast: must<HTMLElement>('#toast'),
     zoomHint: must<HTMLElement>('#zoom-hint'),
@@ -198,13 +200,23 @@ export function renderStats(
   info: BuildingInfo | null,
   availability: ClaimAvailability,
 ): void {
-  const { statsCard, statName, statOsmId, statType, statHeight, statArea, claimButton } =
-    el();
+  const {
+    statsCard,
+    statName,
+    statOsmId,
+    statType,
+    statHeight,
+    statArea,
+    statPrice,
+    claimButton,
+  } = el();
 
   if (!info) {
     statsCard.hidden = true;
     return;
   }
+
+  const price = priceForBuilding(info);
 
   statsCard.hidden = false;
   statName.textContent = info.name;
@@ -213,6 +225,7 @@ export function renderStats(
   statType.textContent = info.type;
   statHeight.textContent = `${formatNumber(info.height)} m`;
   statArea.textContent = `${formatNumber(info.areaM2)} m²`;
+  statPrice.textContent = formatCurrency(price);
 
   if (availability.claimed) {
     claimButton.disabled = true;
@@ -220,11 +233,11 @@ export function renderStats(
     claimButton.dataset.state = 'claimed';
   } else if (!availability.affordable) {
     claimButton.disabled = true;
-    claimButton.textContent = `Insufficient funds — need ${formatCurrency(CLAIM_COST)}`;
+    claimButton.textContent = `Insufficient funds — need ${formatCurrency(price)}`;
     claimButton.dataset.state = 'blocked';
   } else {
     claimButton.disabled = false;
-    claimButton.textContent = `Claim Building (${formatCurrency(CLAIM_COST)})`;
+    claimButton.textContent = `Claim Building (${formatCurrency(price)})`;
     claimButton.dataset.state = 'available';
   }
 }

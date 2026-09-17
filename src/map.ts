@@ -10,6 +10,8 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 
 import {
   ensureOverlayLayers,
+  growSelection,
+  hideBasemapBuildingShapes,
   pickBuildingAt,
   resolveBuildingLayers,
   setHoveredBuilding,
@@ -116,7 +118,28 @@ export function createMap(container: HTMLElement, callbacks: MapCallbacks): MapC
       return null;
     }
 
-    return pickBuildingAt(features, cursor);
+    const picked = pickBuildingAt(features, cursor);
+    if (!picked) return null;
+
+    // Whole-building growth needs neighbours that do not cover the cursor, so
+    // hand the picker a geographic-bbox query over the same building layers.
+    return growSelection(picked, (bbox) => {
+      const southWest = map.project([bbox[0], bbox[1]]);
+      const northEast = map.project([bbox[2], bbox[3]]);
+      try {
+        return map.queryRenderedFeatures(
+          [
+            [southWest.x, southWest.y],
+            [northEast.x, northEast.y],
+          ],
+          { layers: buildingLayerIds },
+        );
+      } catch (error) {
+        // Same stale-layer failure mode as the point query above.
+        console.warn('[map] neighbour query failed', error);
+        return [];
+      }
+    });
   }
 
   function clearHover(): void {
@@ -181,16 +204,21 @@ export function createMap(container: HTMLElement, callbacks: MapCallbacks): MapC
   map.on('load', () => {
     refreshBuildingLayers();
     ensureOverlayLayers(map);
+    // Blank (not hide) the basemap's own building shapes: the procedural three.js
+    // layer replaces them, while paint-opacity-0 keeps the layers queryable for
+    // hover/click picking.
+    hideBasemapBuildingShapes(map);
     console.info(
       `[map] building layers: ${buildingLayerIds.join(', ') || 'none found in style'}`,
     );
   });
 
-  // Re-resolve if the style is replaced, since layer ids and the overlay
-  // sources both disappear with it.
+  // Re-resolve if the style is replaced, since layer ids, paint overrides and the
+  // overlay sources all disappear with it.
   map.on('style.load', () => {
     refreshBuildingLayers();
     ensureOverlayLayers(map);
+    hideBasemapBuildingShapes(map);
   });
 
   map.on('error', (event) => {
